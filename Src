@@ -1,0 +1,126 @@
+#define F_CPU 10000000UL // 10MHz crystal oscillator
+
+#include <avr/io.h>
+#include <util/delay.h>
+
+// Finite State Machine (FSM) states
+typedef enum {
+	FIND_LINE,
+	FIX_POSITION,
+	FOLLOW_LINE
+} FSM_State;
+
+// Global variables for sensor readings
+uint8_t left = 0;
+uint8_t right = 0;
+uint8_t line_detected = 0;
+
+// Reads the active-high logic from the LEDs/Sensors
+void Readings(void) {
+	left  = (PIND & (1 << PD5)); // D1 LED as Left Sensor
+	right = (PIND & (1 << PD4)); // D2 LED as Right Sensor
+
+	line_detected = left | right;
+}
+
+// Configures Timer 1 for Hardware PWM on PB1 and PB2
+void PWM_Hardware_Init(void) {
+	// 1. Set PB1 (OC1A) and PB2 (OC1B) as outputs for the Enables
+	DDRB |= (1 << PB1) | (1 << PB2);
+
+	// 2. Timer 1 Configuration: Fast PWM, 8-bit (Mode 5)
+	// Non-inverting mode for both channels
+	TCCR1A = (1 << COM1A1) | (1 << COM1B1) | (1 << WGM10);
+	
+	// 3. Set Prescaler to 8 (CS11 = 1) and finish Mode 5 setup (WGM12 = 1)
+	// Generates a ~4.88 kHz PWM frequency
+	TCCR1B = (1 << WGM12) | (1 << CS11);
+
+	// 4. Initialize speeds to 0 (motors off at boot)
+	OCR1A = 0; // Duty cycle for Left Motor ENA (PB1)
+	OCR1B = 0; // Duty cycle for Right Motor ENB (PB2)
+}
+
+// Helper function to dynamically update motor speeds (0 - 255)
+void Set_Speed(uint8_t speed_left, uint8_t speed_right) {
+	OCR1A = speed_left;  // Instantly updates hardware PWM for Left Motor
+	OCR1B = speed_right; // Instantly updates hardware PWM for Right Motor
+}
+
+int main(void) {
+	// Set PC0-PC3 as motor direction outputs for the L298N
+	DDRC |= 0x0F;
+	PORTC &= 0xF0; // Clear previous outputs on PC0-PC3 to prevent sudden jumps
+
+	// Set sensors (PD4, PD5) as inputs
+	DDRD &= ~((1 << PD4) | (1 << PD5));
+	PORTD &= ~((1 << PD4) | (1 << PD5)); // No pull-ups needed for active-high LEDs
+
+	// Initialize the hardware PWM subsystem
+	PWM_Hardware_Init();
+
+	// Start the FSM logic
+	FSM_State current_state = FIND_LINE;
+
+	while (1) {
+		switch (current_state) {
+			
+			case FIND_LINE:
+			Readings();
+			if (line_detected) {
+				current_state = FIX_POSITION;
+				} else {
+				// Pivot left searching for the line
+				PORTC = (PORTC & 0xF0) | 0x06;
+				Set_Speed(150, 150); // Moderate speed for turning
+				_delay_ms(500);
+				Set_Speed(0, 0); // Stop completely before reading again
+				_delay_ms(100);
+				Readings();
+			}
+			break;
+
+			case FIX_POSITION:
+			Readings();
+			if (left && right) {
+				// Robot is perfectly centered
+				Set_Speed(0, 0);
+				current_state = FOLLOW_LINE;
+			}
+			else if (left && !right) {
+				// Drifted right, pivot left to correct
+				PORTC = (PORTC & 0xF0) | 0x06;
+				// Differential steering: Inner wheel slower, outer faster
+				Set_Speed(100, 200);
+			}
+			else if (!left && right) {
+				// Drifted left, pivot right to correct
+				PORTC = (PORTC & 0xF0) | 0x09;
+				// Differential steering: Outer wheel faster, inner slower
+				Set_Speed(200, 100);
+			}
+			else {
+				// Edge case: line completely lost during correction
+				Set_Speed(0, 0);
+			}
+			break;
+
+			case FOLLOW_LINE:
+			// Both motors set to forward logic
+			PORTC = (PORTC & 0xF0) | 0x0A;
+			Set_Speed(200, 200); // Cruising speed
+			Readings();
+			
+			if (!line_detected) {
+				// Line completely lost
+				Set_Speed(0, 0);
+			}
+			else if (!(left && right)) {
+				// One sensor dropped off, correction needed
+				current_state = FIX_POSITION;
+			}
+			break;
+		}
+	}
+	return 0;
+}
